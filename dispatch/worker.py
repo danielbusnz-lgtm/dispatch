@@ -1,39 +1,118 @@
 import time
 import signal
+import logging
+from datetime import datetime
 from typing import Optional
 from .queue import Queue
 
+logger = logging.getLogger("dispatch.worker")
+
 
 class Worker:
-    def __init__(self, queue: Queue, poll_interval: float = 1.0, concurrency: int = 1):
+    def __init__(
+        self,
+        queue: Queue,
+        poll_interval: float = 1.0,
+        concurrency: int = 1,
+        job_timeout: Optional[float] = None,
+        stale_job_timeout: int = 300,
+        recovery_interval: int = 60,
+    ):
         self.queue = queue
         self.poll_interval = poll_interval
         self.concurrency = concurrency
+        self.job_timeout = job_timeout
+        self.stale_job_timeout = stale_job_timeout
+        self.recovery_interval = recovery_interval
         self._running = False
+        self._jobs_processed = 0
+        self._jobs_failed = 0
+        self._last_recovery_check = 0.0
 
     def start(self):
         self._running = True
         signal.signal(signal.SIGINT, self._stop)
         signal.signal(signal.SIGTERM, self._stop)
-        print(f"Worker started. Polling every {self.poll_interval}s...")
+        logger.info(
+            "Worker started. poll_interval=%.1fs, job_timeout=%s, stale_job_timeout=%ds",
+            self.poll_interval,
+            f"{self.job_timeout}s" if self.job_timeout else "none",
+            self.stale_job_timeout,
+        )
         while self._running:
+            self._maybe_recover_stale_jobs()
             self._tick()
             time.sleep(self.poll_interval)
+        logger.info(
+            "Worker stopped. Processed %d jobs (%d failed).",
+            self._jobs_processed,
+            self._jobs_failed,
+        )
 
     def _tick(self):
         job = self.queue.dequeue()
         if not job:
             return
-        print(f"Running job {job.id[:8]} ({job.func_name})")
-        job.run()
+
+        logger.info("Running job %s (%s) [priority=%d, attempt=%d/%d]",
+                    job.id[:8], job.func_name, job.priority,
+                    job.retries + 1, job.max_retries + 1)
+
+        if self.job_timeout is not None:
+            self._run_with_timeout(job, self.job_timeout)
+        else:
+            job.run()
+
         self.queue.update(job)
+        self._jobs_processed += 1
+
         if job.status == "done":
-            print(f"  done in {(job.finished_at - job.started_at).total_seconds():.2f}s")
+            duration = (job.finished_at - job.started_at).total_seconds()
+            logger.info("Job %s completed in %.2fs", job.id[:8], duration)
         elif job.status == "failed":
-            print(f"  failed: {job.error}")
+            self._jobs_failed += 1
+            logger.error("Job %s failed permanently: %s", job.id[:8], job.error)
         elif job.status == "pending":
-            print(f"  retrying ({job.retries}/{job.max_retries})")
+            logger.warning("Job %s will retry (%d/%d): %s",
+                          job.id[:8], job.retries, job.max_retries, job.error)
+
+    def _run_with_timeout(self, job, timeout: float):
+        """Run a job with a timeout using a thread."""
+        import threading
+
+        result_holder = {}
+
+        def target():
+            try:
+                job.run()
+            except Exception as e:
+                result_holder["error"] = e
+
+        thread = threading.Thread(target=target, daemon=True)
+        thread.start()
+        thread.join(timeout=timeout)
+
+        if thread.is_alive():
+            # Thread is still running — job timed out
+            job.error = f"Job timed out after {timeout}s"
+            job.finished_at = datetime.utcnow()
+            if job.retries < job.max_retries:
+                job.retries += 1
+                job.status = "pending"
+            else:
+                job.status = "failed"
+            logger.warning("Job %s timed out after %.1fs", job.id[:8], timeout)
+
+    def _maybe_recover_stale_jobs(self):
+        """Periodically check for and recover stale jobs stuck in 'running' state."""
+        now = time.monotonic()
+        if now - self._last_recovery_check < self.recovery_interval:
+            return
+        self._last_recovery_check = now
+        recovered = self.queue.recover_stale_jobs(timeout_seconds=self.stale_job_timeout)
+        if recovered > 0:
+            logger.warning("Recovered %d stale job(s) back to pending.", recovered)
 
     def _stop(self, *_):
-        print("\nShutting down worker...")
+        logger.info("Shutdown signal received, finishing current work...")
         self._running = False
