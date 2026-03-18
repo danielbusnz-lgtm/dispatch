@@ -2,7 +2,7 @@ import sqlite3
 import json
 import pickle
 import base64
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable, Optional
 from .job import Job
@@ -35,9 +35,14 @@ class Queue:
                     error TEXT,
                     created_at TEXT NOT NULL,
                     started_at TEXT,
-                    finished_at TEXT
+                    finished_at TEXT,
+                    scheduled_at TEXT
                 )
             """)
+            # Migration: add scheduled_at column if it doesn't exist
+            columns = [row[1] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()]
+            if "scheduled_at" not in columns:
+                conn.execute("ALTER TABLE jobs ADD COLUMN scheduled_at TEXT")
 
     def _encode(self, obj) -> str:
         return base64.b64encode(pickle.dumps(obj)).decode()
@@ -45,13 +50,30 @@ class Queue:
     def _decode(self, blob: str):
         return pickle.loads(base64.b64decode(blob))
 
-    def enqueue(self, func: Callable, *args, priority: int = 0, max_retries: int = 3, **kwargs) -> Job:
+    def enqueue(
+        self,
+        func: Callable,
+        *args,
+        priority: int = 0,
+        max_retries: int = 3,
+        delay: Optional[float] = None,
+        scheduled_at: Optional[datetime] = None,
+        **kwargs,
+    ) -> Job:
         job = Job(func=func, args=args, kwargs=kwargs, priority=priority, max_retries=max_retries)
+
+        if scheduled_at is not None:
+            job.scheduled_at = scheduled_at
+        elif delay is not None:
+            job.scheduled_at = datetime.utcnow() + timedelta(seconds=delay)
+        else:
+            job.scheduled_at = None
+
         with self._conn() as conn:
             conn.execute("""
                 INSERT INTO jobs (id, func_blob, args_blob, kwargs_blob, func_name,
-                    priority, retries, max_retries, status, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    priority, retries, max_retries, status, created_at, scheduled_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 job.id,
                 self._encode(job.func),
@@ -63,17 +85,23 @@ class Queue:
                 job.max_retries,
                 job.status,
                 job.created_at.isoformat(),
+                job.scheduled_at.isoformat() if job.scheduled_at else None,
             ))
         return job
 
     def dequeue(self) -> Optional[Job]:
+        now = datetime.utcnow().isoformat()
         with self._conn() as conn:
             row = conn.execute("""
                 SELECT * FROM jobs WHERE status = 'pending'
+                    AND (scheduled_at IS NULL OR scheduled_at <= ?)
                 ORDER BY priority DESC, created_at ASC LIMIT 1
-            """).fetchone()
+            """, (now,)).fetchone()
             if not row:
                 return None
+            scheduled_at = None
+            if row["scheduled_at"]:
+                scheduled_at = datetime.fromisoformat(row["scheduled_at"])
             job = Job(
                 func=self._decode(row["func_blob"]),
                 args=self._decode(row["args_blob"]),
@@ -84,6 +112,7 @@ class Queue:
                 max_retries=row["max_retries"],
                 status=row["status"],
                 created_at=datetime.fromisoformat(row["created_at"]),
+                scheduled_at=scheduled_at,
             )
             conn.execute("UPDATE jobs SET status = 'running', started_at = ? WHERE id = ?",
                          (datetime.utcnow().isoformat(), job.id))
@@ -93,7 +122,7 @@ class Queue:
         with self._conn() as conn:
             conn.execute("""
                 UPDATE jobs SET status=?, retries=?, result_blob=?, error=?,
-                    started_at=?, finished_at=?
+                    started_at=?, finished_at=?, scheduled_at=?
                 WHERE id=?
             """, (
                 job.status,
@@ -102,15 +131,36 @@ class Queue:
                 job.error,
                 job.started_at.isoformat() if job.started_at else None,
                 job.finished_at.isoformat() if job.finished_at else None,
+                job.scheduled_at.isoformat() if job.scheduled_at else None,
                 job.id,
             ))
+
+    def recover_stale_jobs(self, timeout_seconds: int = 300) -> int:
+        """Reset jobs stuck in 'running' state for longer than timeout_seconds back to 'pending'."""
+        cutoff = (datetime.utcnow() - timedelta(seconds=timeout_seconds)).isoformat()
+        with self._conn() as conn:
+            cursor = conn.execute("""
+                UPDATE jobs SET status = 'pending', started_at = NULL
+                WHERE status = 'running' AND started_at < ?
+            """, (cutoff,))
+            return cursor.rowcount
 
     def stats(self) -> dict:
         with self._conn() as conn:
             rows = conn.execute("""
                 SELECT status, COUNT(*) as count FROM jobs GROUP BY status
             """).fetchall()
-            return {row["status"]: row["count"] for row in rows}
+            stats = {row["status"]: row["count"] for row in rows}
+
+            # Count scheduled jobs that aren't yet ready
+            now = datetime.utcnow().isoformat()
+            scheduled_row = conn.execute("""
+                SELECT COUNT(*) as count FROM jobs
+                WHERE status = 'pending' AND scheduled_at IS NOT NULL AND scheduled_at > ?
+            """, (now,)).fetchone()
+            stats["scheduled"] = scheduled_row["count"] if scheduled_row else 0
+
+            return stats
 
     def all_jobs(self, status: Optional[str] = None, limit: int = 50) -> list:
         with self._conn() as conn:
