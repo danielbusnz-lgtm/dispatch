@@ -1,6 +1,7 @@
 import sqlite3
 import json
 import pickle
+import hashlib
 import base64
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -36,19 +37,48 @@ class Queue:
                     created_at TEXT NOT NULL,
                     started_at TEXT,
                     finished_at TEXT,
-                    scheduled_at TEXT
+                    scheduled_at TEXT,
+                    dedup_key TEXT
                 )
             """)
-            # Migration: add scheduled_at column if it doesn't exist
+            # Migration: add columns if they don't exist
             columns = [row[1] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()]
             if "scheduled_at" not in columns:
                 conn.execute("ALTER TABLE jobs ADD COLUMN scheduled_at TEXT")
+            if "dedup_key" not in columns:
+                conn.execute("ALTER TABLE jobs ADD COLUMN dedup_key TEXT")
+
+            # Create dead_letter_jobs table for permanently failed jobs that exceeded retries
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS dead_letter_jobs (
+                    id TEXT PRIMARY KEY,
+                    original_job_id TEXT NOT NULL,
+                    func_blob TEXT NOT NULL,
+                    args_blob TEXT NOT NULL,
+                    kwargs_blob TEXT NOT NULL,
+                    func_name TEXT NOT NULL,
+                    priority INTEGER DEFAULT 0,
+                    retries INTEGER DEFAULT 0,
+                    max_retries INTEGER DEFAULT 3,
+                    error TEXT,
+                    created_at TEXT NOT NULL,
+                    started_at TEXT,
+                    finished_at TEXT,
+                    moved_at TEXT NOT NULL
+                )
+            """)
 
     def _encode(self, obj) -> str:
         return base64.b64encode(pickle.dumps(obj)).decode()
 
     def _decode(self, blob: str):
         return pickle.loads(base64.b64decode(blob))
+
+    def _compute_dedup_key(self, func: Callable, args: tuple, kwargs: dict) -> str:
+        """Compute a deterministic dedup key from function name and arguments."""
+        func_name = f"{func.__module__}.{func.__qualname__}"
+        key_data = pickle.dumps((func_name, args, kwargs))
+        return hashlib.sha256(key_data).hexdigest()
 
     def enqueue(
         self,
@@ -58,8 +88,9 @@ class Queue:
         max_retries: int = 3,
         delay: Optional[float] = None,
         scheduled_at: Optional[datetime] = None,
+        deduplicate: bool = False,
         **kwargs,
-    ) -> Job:
+    ) -> Optional[Job]:
         job = Job(func=func, args=args, kwargs=kwargs, priority=priority, max_retries=max_retries)
 
         if scheduled_at is not None:
@@ -69,11 +100,23 @@ class Queue:
         else:
             job.scheduled_at = None
 
+        dedup_key = None
+        if deduplicate:
+            dedup_key = self._compute_dedup_key(func, args, kwargs)
+            with self._conn() as conn:
+                existing = conn.execute("""
+                    SELECT id FROM jobs
+                    WHERE dedup_key = ? AND status IN ('pending', 'running')
+                    LIMIT 1
+                """, (dedup_key,)).fetchone()
+                if existing:
+                    return None
+
         with self._conn() as conn:
             conn.execute("""
                 INSERT INTO jobs (id, func_blob, args_blob, kwargs_blob, func_name,
-                    priority, retries, max_retries, status, created_at, scheduled_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    priority, retries, max_retries, status, created_at, scheduled_at, dedup_key)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 job.id,
                 self._encode(job.func),
@@ -86,6 +129,7 @@ class Queue:
                 job.status,
                 job.created_at.isoformat(),
                 job.scheduled_at.isoformat() if job.scheduled_at else None,
+                dedup_key,
             ))
         return job
 
@@ -135,6 +179,94 @@ class Queue:
                 job.id,
             ))
 
+        # Move permanently failed jobs to the dead letter queue
+        if job.status == "failed":
+            self._move_to_dead_letter(job)
+
+    def _move_to_dead_letter(self, job: Job):
+        """Move a permanently failed job to the dead letter queue for later inspection or replay."""
+        with self._conn() as conn:
+            row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job.id,)).fetchone()
+            if not row:
+                return
+            conn.execute("""
+                INSERT OR IGNORE INTO dead_letter_jobs
+                    (id, original_job_id, func_blob, args_blob, kwargs_blob, func_name,
+                     priority, retries, max_retries, error, created_at, started_at, finished_at, moved_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                row["id"],
+                row["id"],
+                row["func_blob"],
+                row["args_blob"],
+                row["kwargs_blob"],
+                row["func_name"],
+                row["priority"],
+                row["retries"],
+                row["max_retries"],
+                row["error"],
+                row["created_at"],
+                row["started_at"],
+                row["finished_at"],
+                datetime.utcnow().isoformat(),
+            ))
+
+    def dead_letter_jobs(self, limit: int = 50) -> list:
+        """Return jobs in the dead letter queue."""
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM dead_letter_jobs ORDER BY moved_at DESC LIMIT ?", (limit,)
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def replay_dead_letter(self, job_id: str) -> Optional[Job]:
+        """Re-enqueue a dead letter job back into the main queue for another attempt."""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM dead_letter_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            if not row:
+                return None
+
+            func = self._decode(row["func_blob"])
+            args = self._decode(row["args_blob"])
+            kwargs = self._decode(row["kwargs_blob"])
+
+            job = Job(
+                func=func,
+                args=args,
+                kwargs=kwargs,
+                priority=row["priority"],
+                max_retries=row["max_retries"],
+            )
+
+            conn.execute("""
+                INSERT INTO jobs (id, func_blob, args_blob, kwargs_blob, func_name,
+                    priority, retries, max_retries, status, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                job.id,
+                row["func_blob"],
+                row["args_blob"],
+                row["kwargs_blob"],
+                job.func_name,
+                job.priority,
+                0,
+                job.max_retries,
+                "pending",
+                job.created_at.isoformat(),
+            ))
+
+            conn.execute("DELETE FROM dead_letter_jobs WHERE id = ?", (job_id,))
+
+            return job
+
+    def purge_dead_letters(self) -> int:
+        """Remove all dead letter jobs. Returns the number of jobs purged."""
+        with self._conn() as conn:
+            cursor = conn.execute("DELETE FROM dead_letter_jobs")
+            return cursor.rowcount
+
     def recover_stale_jobs(self, timeout_seconds: int = 300) -> int:
         """Reset jobs stuck in 'running' state for longer than timeout_seconds back to 'pending'."""
         cutoff = (datetime.utcnow() - timedelta(seconds=timeout_seconds)).isoformat()
@@ -159,6 +291,12 @@ class Queue:
                 WHERE status = 'pending' AND scheduled_at IS NOT NULL AND scheduled_at > ?
             """, (now,)).fetchone()
             stats["scheduled"] = scheduled_row["count"] if scheduled_row else 0
+
+            # Count dead letter jobs
+            dlq_row = conn.execute(
+                "SELECT COUNT(*) as count FROM dead_letter_jobs"
+            ).fetchone()
+            stats["dead_letter"] = dlq_row["count"] if dlq_row else 0
 
             return stats
 
