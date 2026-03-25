@@ -15,8 +15,10 @@ class Queue:
         self._init_db()
 
     def _conn(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=10)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
         return conn
 
     def _init_db(self):
@@ -47,6 +49,20 @@ class Queue:
                 conn.execute("ALTER TABLE jobs ADD COLUMN scheduled_at TEXT")
             if "dedup_key" not in columns:
                 conn.execute("ALTER TABLE jobs ADD COLUMN dedup_key TEXT")
+
+            # Indexes for common query patterns
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_jobs_status_scheduled
+                ON jobs (status, scheduled_at, priority DESC, created_at ASC)
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_jobs_dedup_key
+                ON jobs (dedup_key) WHERE dedup_key IS NOT NULL
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_jobs_status_started
+                ON jobs (status, started_at) WHERE status = 'running'
+            """)
 
             # Create dead_letter_jobs table for permanently failed jobs that exceeded retries
             conn.execute("""
@@ -103,7 +119,11 @@ class Queue:
         dedup_key = None
         if deduplicate:
             dedup_key = self._compute_dedup_key(func, args, kwargs)
-            with self._conn() as conn:
+
+        # Use a single connection with a transaction for the dedup check + insert
+        # to prevent race conditions between concurrent workers.
+        with self._conn() as conn:
+            if dedup_key is not None:
                 existing = conn.execute("""
                     SELECT id FROM jobs
                     WHERE dedup_key = ? AND status IN ('pending', 'running')
@@ -112,7 +132,6 @@ class Queue:
                 if existing:
                     return None
 
-        with self._conn() as conn:
             conn.execute("""
                 INSERT INTO jobs (id, func_blob, args_blob, kwargs_blob, func_name,
                     priority, retries, max_retries, status, created_at, scheduled_at, dedup_key)
@@ -134,18 +153,34 @@ class Queue:
         return job
 
     def dequeue(self) -> Optional[Job]:
+        """Atomically claim a pending job using UPDATE ... RETURNING to avoid races."""
         now = datetime.utcnow().isoformat()
+        started_at = datetime.utcnow().isoformat()
+
         with self._conn() as conn:
+            # Find the best candidate first, then atomically claim it.
+            # Using a subquery with LIMIT 1 + UPDATE ensures only one worker
+            # picks up each job even under concurrent access.
             row = conn.execute("""
-                SELECT * FROM jobs WHERE status = 'pending'
-                    AND (scheduled_at IS NULL OR scheduled_at <= ?)
-                ORDER BY priority DESC, created_at ASC LIMIT 1
-            """, (now,)).fetchone()
+                UPDATE jobs
+                SET status = 'running', started_at = ?
+                WHERE id = (
+                    SELECT id FROM jobs
+                    WHERE status = 'pending'
+                      AND (scheduled_at IS NULL OR scheduled_at <= ?)
+                    ORDER BY priority DESC, created_at ASC
+                    LIMIT 1
+                )
+                RETURNING *
+            """, (started_at, now)).fetchone()
+
             if not row:
                 return None
+
             scheduled_at = None
             if row["scheduled_at"]:
                 scheduled_at = datetime.fromisoformat(row["scheduled_at"])
+
             job = Job(
                 func=self._decode(row["func_blob"]),
                 args=self._decode(row["args_blob"]),
@@ -154,12 +189,11 @@ class Queue:
                 priority=row["priority"],
                 retries=row["retries"],
                 max_retries=row["max_retries"],
-                status=row["status"],
+                status="running",
                 created_at=datetime.fromisoformat(row["created_at"]),
+                started_at=datetime.fromisoformat(started_at),
                 scheduled_at=scheduled_at,
             )
-            conn.execute("UPDATE jobs SET status = 'running', started_at = ? WHERE id = ?",
-                         (datetime.utcnow().isoformat(), job.id))
             return job
 
     def update(self, job: Job):
